@@ -6,6 +6,74 @@ from openai import OpenAI
 from tavily import TavilyClient
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+import sqlite3
+
+def iniciar_banco():
+    conexao = sqlite3.connect("historico.db")
+    cursor = conexao.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS historico (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id  INTEGER,
+            role     TEXT,
+            conteudo TEXT
+        )
+    """)
+    conexao.commit()
+    conexao.close()
+
+def salvar_mensagem(chat_id, role, conteudo):
+    conexao = sqlite3.connect("historico.db")
+    cursor = conexao.cursor()
+    cursor.execute(
+        "INSERT INTO historico (chat_id, role, conteudo) VALUES (?, ?, ?)",
+        (chat_id, role, conteudo)
+    )
+    conexao.commit()
+    conexao.close()
+
+def carregar_historico(chat_id):
+    conexao = sqlite3.connect("historico.db")
+    cursor = conexao.cursor()
+    cursor.execute(
+        "SELECT role, conteudo FROM historico WHERE chat_id = ? ORDER BY id DESC LIMIT 20",
+        (chat_id,)
+    )
+    mensagens = [{"role": row[0], "content": row[1]} for row in cursor.fetchall()]
+    conexao.close()
+    mensagens.reverse()
+    return mensagens
+
+async def limpar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id= update.message.chat_id
+    conexao = sqlite3.connect("historico.db")
+    cursor = conexao.cursor()
+    cursor.execute("DELETE FROM historico WHERE chat_id = ?", (chat_id,))
+    conexao.commit()
+    conexao.close()
+    await update.message.reply_text("Histórico limpo! Pode começar de novo.")    
+
+async def historico (update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    mensagens = carregar_historico(chat_id)
+
+    if not mensagens:
+        await update.message.reply_text("Nenhuma conversar foi encontrada ainda, converse mais comigo!")
+        return
+    
+    texto = "Últimas mensagens:\n\n"
+    for msg in mensagens:
+        if msg["role"] == "user":
+            texto += f"Você: {msg['content']}\n"
+        else:
+            texto += f"Bot: {msg['content']}\n"
+        texto += "--\n"
+    
+    limite = 4096
+    for i in range(0, len (texto), limite):
+        await update.message.reply_text(texto[i:i + limite])
+
+    
 
 load_dotenv()
 
@@ -21,7 +89,6 @@ client = OpenAI(
 
 tavily = TavilyClient(api_key=TAVILY_API_KEY)
 
-historico = {}
 
 logging.basicConfig(level=logging.INFO)
 
@@ -53,21 +120,23 @@ def buscar_web(query: str) -> str:
 
 
 def perguntar_ia(chat_id: int, mensagem_usuario: str) -> str:
-    if chat_id not in historico:
-        historico[chat_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    mensagens = carregar_historico(chat_id)
 
-    historico[chat_id].append({"role": "user", "content": mensagem_usuario})
+    if not mensagens:
+        mensagens = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    mensagens.append({"role": "user", "content": mensagem_usuario})
 
     if precisa_buscar_web(mensagem_usuario):
         resultados = buscar_web(mensagem_usuario)
-        historico[chat_id].append({
+        mensagens.append({
             "role": "system",
             "content": f"Resultados da busca na web:\n{resultados}",
         })
 
     resposta = client.chat.completions.create(
         model=MODEL,
-        messages=historico[chat_id],
+        messages=mensagens,
     )
 
     if not resposta.choices:
@@ -77,7 +146,9 @@ def perguntar_ia(chat_id: int, mensagem_usuario: str) -> str:
     if not texto_resposta:
         return "Desculpe, não consegui gerar uma resposta agora. Tente de novo."
     texto_resposta = texto_resposta.strip()
-    historico[chat_id].append({"role": "assistant", "content": texto_resposta})
+
+    salvar_mensagem(chat_id, "user", mensagem_usuario)
+    salvar_mensagem(chat_id, "assistant", texto_resposta)
 
     return texto_resposta
 
@@ -113,9 +184,12 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+    iniciar_banco()
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, responder))
+    app.add_handler(CommandHandler("limpar", limpar))
+    app.add_handler(CommandHandler("historico", historico))
     print("Bot rodando...")
     app.run_polling()
 
